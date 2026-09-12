@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# Never commit a Lambda API key or a watcher log (logs echo instance IPs).
+*.log
+api_key
+*api_key*
+secret_*

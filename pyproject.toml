@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# No [project] table on purpose: lambda_watch.py is a single stdlib-only script
+# meant to be run in place (./lambda_watch.py), not installed. This file exists
+# so `python3 -m pytest` works from the repo root with no arguments.
