@@ -1,4 +1,4 @@
-# lambda-poll
+# Lambda.ai API Poller
 
 Grab a 1x Blackwell GPU on Lambda Cloud the moment one frees up.
 
@@ -72,6 +72,7 @@ exactly, use `--instance-type gpu_1x_b200_sxm6`.
 | 1 | `--once` and no capacity |
 | 2 | Fatal: bad key, unknown SSH key name, quota exceeded, bad filters |
 | 3 | `--timeout` elapsed with no capacity |
+| 4 | A launch may have gone through but couldn't be confirmed; stopped so it can't launch twice. Check the dashboard. |
 | 130 | Ctrl-C |
 
 ## Behavior that matters
@@ -81,6 +82,13 @@ exactly, use `--instance-type gpu_1x_b200_sxm6`.
   track of a won B200 costs ~$168/day.
 - **Losing the race is normal.** When two watchers see the same freed GPU, the
   loser gets `insufficient-capacity`; that is logged and polling resumes.
+- **A launch that looks like a failure is checked.** A timeout, a 5xx, or a
+  garbled response can hide a launch that actually went through. Unless the
+  launch response returns an instance id, the watcher compares `/instances`
+  against the IDs it saw at startup, waiting up to 3 minutes for the instance to
+  show up (one check for a plain `insufficient-capacity`). If a new instance
+  shows up, that counts as success. If `/instances` can't be read at all, the
+  watcher stops with exit 4 rather than risk a second launch.
 - **It won't double-launch.** On startup, if you already own an instance of a
   target type (`active`/`booting`/`unhealthy`), it reports it and exits rather
   than adding a second one. Override with `--allow-duplicate`.
@@ -113,6 +121,7 @@ reliable.
 python3 -m pytest tests/ -q
 ```
 
-81 tests, no network: the selection/classification logic, the launch payload, and
+94 tests, no network: the selection/classification logic, the launch payload, and
 the poll loop driven against a stubbed client (capacity appearing, races lost,
-quota exceeded, duplicate guard, timeout).
+quota exceeded, duplicate guard, timeout, launches that land despite an
+error response).

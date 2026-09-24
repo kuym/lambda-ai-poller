@@ -41,6 +41,15 @@ USER_AGENT = "mosaicist-lambda-watch/1.0"
 MIN_LAUNCH_INTERVAL_S = 13.0
 MIN_REQUEST_INTERVAL_S = 1.1
 
+# A launch can take well over the default 30s to answer. Timing out early turns
+# a real success into an "unknown" outcome, so give that one call more room.
+LAUNCH_TIMEOUT_S = 120.0
+
+# After a launch whose outcome is unclear (timeout, 5xx, garbled response), how
+# long to watch /instances for the new box before deciding it never happened.
+RECONCILE_BUDGET_S = 180.0
+RECONCILE_INTERVAL_S = 15.0
+
 # GPU marketing names in the Blackwell family, matched against `gpu_description`
 # so instance types Lambda adds later (GB200, B300, RTX PRO 6000) are picked up
 # without a code change.
@@ -249,6 +258,22 @@ def existing_target_instances(instances: list[dict], target_types: list[str]) ->
     return out
 
 
+def new_target_instances(
+    instances: list[dict], known_ids: set[str], target_types: list[str]
+) -> list[dict]:
+    """Live target instances that were not on the account when we started.
+
+    This is the ground truth for "did our launch land?". The launch response can
+    be lost (timeout, dropped connection) or look like a failure (5xx after the
+    backend already committed), but the instance still shows up here.
+    """
+    return [
+        inst
+        for inst in existing_target_instances(instances, target_types)
+        if inst.get("id") not in known_ids
+    ]
+
+
 def next_sleep(interval: float, jitter: float) -> float:
     """Poll interval with jitter, so many watchers do not sync into one burst."""
     return max(1.0, interval + random.uniform(-jitter, jitter))
@@ -293,7 +318,9 @@ class LambdaClient:
             time.sleep(MIN_REQUEST_INTERVAL_S - gap)
         self._last_request = time.monotonic()
 
-    def request(self, method: str, path: str, body: dict | None = None) -> dict:
+    def request(
+        self, method: str, path: str, body: dict | None = None, *, timeout: float | None = None
+    ) -> dict:
         self._throttle()
         data = json.dumps(body).encode() if body is not None else None
         headers = {
@@ -309,7 +336,7 @@ class LambdaClient:
             f"{self._base}/{path.lstrip('/')}", data=data, method=method, headers=headers
         )
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout or self._timeout) as resp:
                 return json.loads(resp.read() or b"{}")
         except urllib.error.HTTPError as exc:
             raw = exc.read()
@@ -338,7 +365,12 @@ class LambdaClient:
         return self.request("GET", "/ssh-keys").get("data") or []
 
     def launch(self, payload: dict) -> list[str]:
-        data = self.request("POST", "/instance-operations/launch", payload).get("data") or {}
+        data = (
+            self.request(
+                "POST", "/instance-operations/launch", payload, timeout=LAUNCH_TIMEOUT_S
+            ).get("data")
+            or {}
+        )
         return data.get("instance_ids") or []
 
 
@@ -537,37 +569,92 @@ def _preflight(cfg: Config, client: LambdaClient) -> tuple[dict, list[str]] | in
     return types, targets
 
 
-def _try_launch(cfg: Config, client: LambdaClient, cand: Candidate) -> tuple[str, dict] | str:
+def _find_landed(
+    client: LambdaClient,
+    known_ids: set[str],
+    targets: list[str],
+    *,
+    budget_s: float,
+) -> dict | None | str:
+    """Look for an instance our launch created, polling for up to `budget_s`.
+
+    Returns the instance if found, None if the account was listed and nothing
+    new is there, or 'unknown' if /instances could never be read.
+    """
+    deadline = time.monotonic() + budget_s
+    listed = False
+    while True:
+        try:
+            fresh = new_target_instances(client.instances(), known_ids, targets)
+            listed = True
+            if fresh:
+                return fresh[0]
+        except (ApiError, urllib.error.URLError, OSError, ValueError) as exc:
+            log(f"  cannot list instances to check the launch ({exc})")
+        if time.monotonic() >= deadline or _stop:
+            return None if listed else "unknown"
+        time.sleep(RECONCILE_INTERVAL_S)
+
+
+def _try_launch(
+    cfg: Config,
+    client: LambdaClient,
+    cand: Candidate,
+    known_ids: set[str],
+    targets: list[str],
+) -> tuple[str, dict] | str:
     """One launch attempt. Returns (instance_id, instance) on success, else a
-    disposition string: 'miss' (keep hunting) or 'fatal'."""
+    disposition string: 'miss' (keep hunting), 'fatal', or 'uncertain' (a
+    launch may have landed and we cannot confirm either way, so stop).
+
+    Only a response carrying an instance id counts as success on its own. Every
+    other outcome is checked against /instances before we resume hunting,
+    because a timeout or 5xx can hide a launch that went through, and hunting
+    on after that would leave a paid instance idling and launch a second one.
+    """
     log(f"  launching {cand} ...")
+    ids: list[str] = []
+    clean_miss = False
     try:
         ids = client.launch(build_launch_payload(cfg, cand))
+        if not ids:
+            log("  launch answered without an instance id; checking whether it landed")
     except ApiError as exc:
         if exc.code == INSUFFICIENT_CAPACITY:
-            log("  lost the race (insufficient capacity); still hunting")
-            return "miss"
-        if not exc.retryable:
+            log("  lost the race (insufficient capacity)")
+            clean_miss = True
+        elif not exc.retryable:
             log(f"  fatal launch error: {exc}", stream=sys.stderr)
             notify("Lambda watcher stopped", str(exc), webhook=cfg.webhook, say=cfg.say)
             return "fatal"
-        log(f"  launch failed ({exc}); will retry")
-        return "miss"
-    except (urllib.error.URLError, OSError) as exc:
-        # The request may have landed even though the response did not, so say so
-        # loudly rather than silently risking a second launch.
-        log(
-            f"  launch request errored in flight ({exc}); "
-            "verify on the dashboard before it retries",
-            stream=sys.stderr,
-        )
-        return "miss"
+        else:
+            log(f"  launch failed ({exc}); checking whether it landed anyway")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        log(f"  launch request errored in flight ({exc}); checking whether it landed")
 
-    if not ids:
-        log("  launch returned no instance ids; treating as a miss")
-        return "miss"
-    instance_id = ids[0]
-    log(f"  launch accepted: {instance_id}")
+    if ids:
+        instance_id = ids[0]
+        log(f"  launch accepted: {instance_id}")
+    else:
+        # A clean insufficient-capacity is near-certain, so one look is enough;
+        # anything murkier gets a few minutes for the instance to show up.
+        found = _find_landed(
+            client, known_ids, targets, budget_s=0 if clean_miss else RECONCILE_BUDGET_S
+        )
+        if found == "unknown" and not clean_miss:
+            msg = (
+                f"launch of {cand} may have succeeded but /instances cannot be read; "
+                "stopped so it cannot launch twice. Check the dashboard."
+            )
+            log(f"  {msg}", stream=sys.stderr)
+            notify("Lambda watcher stopped", msg, webhook=cfg.webhook, say=cfg.say)
+            return "uncertain"
+        if not isinstance(found, dict):
+            log("  no new instance on the account; still hunting")
+            return "miss"
+        instance_id = found["id"]
+        log(f"  launch did land: found {instance_id} ({found.get('status')})")
+
     inst = wait_until_active(client, instance_id) if cfg.wait_for_active else {}
     return instance_id, inst
 
@@ -580,12 +667,17 @@ def watch(cfg: Config) -> int:
         return pre
     types, targets = pre
 
+    # Snapshot what the account already has, so a launch whose response we
+    # never saw can still be recognized by the new id it leaves behind.
+    try:
+        instances = client.instances()
+    except ApiError as exc:
+        log(f"cannot list instances: {exc}", stream=sys.stderr)
+        return 2
+    known_ids = {inst.get("id") for inst in instances}
+
     if not cfg.allow_duplicate:
-        try:
-            dupes = existing_target_instances(client.instances(), targets)
-        except ApiError as exc:
-            log(f"cannot list instances: {exc}", stream=sys.stderr)
-            return 2
+        dupes = existing_target_instances(instances, targets)
         if dupes:
             for inst in dupes:
                 log(
@@ -648,9 +740,11 @@ def watch(cfg: Config) -> int:
                 if last_launch_attempt and gap < MIN_LAUNCH_INTERVAL_S:
                     time.sleep(MIN_LAUNCH_INTERVAL_S - gap)
                 last_launch_attempt = time.monotonic()
-                result = _try_launch(cfg, client, cand)
+                result = _try_launch(cfg, client, cand, known_ids, targets)
                 if result == "fatal":
                     return 2
+                if result == "uncertain":
+                    return 4
                 if result == "miss":
                     continue
                 instance_id, inst = result

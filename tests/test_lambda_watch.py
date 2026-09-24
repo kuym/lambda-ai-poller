@@ -316,19 +316,39 @@ class TestCli:
 
 class FakeClient:
     """Stand-in for LambdaClient: serves scripted /instance-types payloads and
-    records launch attempts."""
+    records launch attempts.
 
-    def __init__(self, payloads, *, launch_results=None, keys=("mykey",), instances=()):
+    `lands_anyway` makes a launch that raises still create an instance, the way
+    a timed-out or 5xx'd request can succeed on Lambda's side. `instances_error`
+    makes every /instances call after startup fail.
+    """
+
+    def __init__(
+        self,
+        payloads,
+        *,
+        launch_results=None,
+        keys=("mykey",),
+        instances=(),
+        lands_anyway=False,
+        instances_error=None,
+    ):
         self._payloads = list(payloads)
         self._launch_results = list(launch_results or [])
         self._keys = keys
         self._instances = list(instances)
+        self._lands_anyway = lands_anyway
+        self._instances_error = instances_error
+        self._instances_calls = 0
         self.launches = []
 
     def ssh_keys(self):
         return [{"name": k} for k in self._keys]
 
     def instances(self):
+        self._instances_calls += 1
+        if self._instances_error and self._instances_calls > 1:
+            raise self._instances_error
         return self._instances
 
     def instance(self, instance_id):
@@ -341,6 +361,15 @@ class FakeClient:
         self.launches.append(payload)
         result = self._launch_results.pop(0) if self._launch_results else ["id-1"]
         if isinstance(result, Exception):
+            if self._lands_anyway:
+                self._instances.append(
+                    {
+                        "id": f"landed-{len(self.launches)}",
+                        "status": "booting",
+                        "instance_type": {"name": payload["instance_type_name"]},
+                        "region": {"name": payload["region_name"]},
+                    }
+                )
             raise result
         return result
 
@@ -351,6 +380,7 @@ def fast(monkeypatch):
     monkeypatch.setattr(lw.time, "sleep", lambda *_: None)
     monkeypatch.setattr(lw, "notify", lambda *a, **k: None)
     monkeypatch.setattr(lw, "MIN_LAUNCH_INTERVAL_S", 0)
+    monkeypatch.setattr(lw, "RECONCILE_BUDGET_S", 0)
 
 
 def run_watch(monkeypatch, client, cfg):
@@ -454,3 +484,99 @@ class TestWatchLoop:
         cfg = self.cfg(regions=["us-west-1", "us-east-1"])
         assert run_watch(monkeypatch, client, cfg) == 0
         assert [p["region_name"] for p in client.launches] == ["us-west-1", "us-east-1"]
+
+
+class TestLaunchThatLooksLikeAFailure:
+    """A launch can succeed on Lambda's side while the response says otherwise.
+    Hunting on after that leaves a paid instance idle and launches a second."""
+
+    def cfg(self, **kw):
+        return lw.Config(api_key="k", ssh_keys=["mykey"], interval=0, jitter=0, **kw)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            TimeoutError("timed out"),
+            lw.urllib.error.URLError("connection reset"),
+            lw.ApiError(504, "", "gateway timeout"),
+            lw.ApiError(500, "global/internal-error", "oops"),
+            lw.ApiError(409, "global/conflict", "conflict"),
+            ValueError("garbled JSON in a 200"),
+        ],
+    )
+    def test_a_launch_that_landed_is_a_success(self, monkeypatch, fast, error):
+        client = FakeClient(
+            [with_capacity(["us-west-1", "us-east-1"])] * 5,
+            launch_results=[error],
+            lands_anyway=True,
+        )
+        assert run_watch(monkeypatch, client, self.cfg()) == 0
+        assert len(client.launches) == 1, "must not launch a second instance"
+
+    def test_empty_instance_ids_that_landed_is_a_success(self, monkeypatch, fast):
+        client = FakeClient([with_capacity(["us-west-1"])], launch_results=[[]])
+        client._instances.append(
+            {"id": "quiet", "status": "booting", "instance_type": {"name": "gpu_1x_b200_sxm6"}}
+        )
+        # Seeded before watch() snapshots, so this is "already owned"; allow it
+        # past the duplicate guard and confirm it is NOT mistaken for our launch.
+        assert run_watch(monkeypatch, client, self.cfg(allow_duplicate=True, once=True)) == 0
+        assert len(client.launches) == 1
+
+    def test_even_insufficient_capacity_is_double_checked(self, monkeypatch, fast):
+        client = FakeClient(
+            [with_capacity(["us-west-1", "us-east-1"])] * 5,
+            launch_results=[lw.ApiError(400, lw.INSUFFICIENT_CAPACITY, "no")],
+            lands_anyway=True,
+        )
+        assert run_watch(monkeypatch, client, self.cfg()) == 0
+        assert len(client.launches) == 1
+
+    def test_a_failure_that_did_not_land_keeps_hunting(self, monkeypatch, fast):
+        client = FakeClient(
+            [with_capacity(["us-west-1"]), with_capacity(["us-west-1"])],
+            launch_results=[lw.ApiError(504, "", "gateway timeout"), ["id-2"]],
+        )
+        assert run_watch(monkeypatch, client, self.cfg()) == 0
+        assert len(client.launches) == 2
+
+    def test_pre_existing_instances_are_not_mistaken_for_ours(self, monkeypatch, fast):
+        client = FakeClient(
+            [with_capacity(["us-west-1"]), with_capacity(["us-west-1"])],
+            launch_results=[lw.ApiError(504, "", "gateway timeout"), ["id-2"]],
+            instances=[
+                {"id": "old", "status": "active", "instance_type": {"name": "gpu_1x_b200_sxm6"}}
+            ],
+        )
+        assert run_watch(monkeypatch, client, self.cfg(allow_duplicate=True)) == 0
+        assert len(client.launches) == 2
+
+    def test_unverifiable_outcome_stops_instead_of_relaunching(self, monkeypatch, fast):
+        client = FakeClient(
+            [with_capacity(["us-west-1", "us-east-1"])] * 5,
+            launch_results=[TimeoutError("timed out")],
+            instances_error=lw.ApiError(503, "", "unavailable"),
+        )
+        assert run_watch(monkeypatch, client, self.cfg()) == 4
+        assert len(client.launches) == 1
+
+    def test_unreadable_instances_after_a_plain_lost_race_keeps_hunting(self, monkeypatch, fast):
+        client = FakeClient(
+            [with_capacity(["us-west-1"]), with_capacity(["us-west-1"])],
+            launch_results=[lw.ApiError(400, lw.INSUFFICIENT_CAPACITY, "no"), ["id-2"]],
+            instances_error=lw.ApiError(503, "", "unavailable"),
+        )
+        assert run_watch(monkeypatch, client, self.cfg()) == 0
+        assert len(client.launches) == 2
+
+
+class TestNewTargetInstances:
+    def test_only_unseen_live_targets(self):
+        insts = [
+            {"id": "old", "status": "active", "instance_type": {"name": "t"}},
+            {"id": "new", "status": "booting", "instance_type": {"name": "t"}},
+            {"id": "dead", "status": "terminated", "instance_type": {"name": "t"}},
+            {"id": "other", "status": "active", "instance_type": {"name": "h100"}},
+        ]
+        got = lw.new_target_instances(insts, {"old"}, ["t"])
+        assert [i["id"] for i in got] == ["new"]
